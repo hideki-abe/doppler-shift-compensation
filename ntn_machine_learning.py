@@ -32,6 +32,144 @@ def baixar_satelites_starlink(num_satelites=50):
 # 2. GERAÇÃO DE DATASET
 # =============================================================================
 
+def gerar_dataset_doppler_d2d(satelites, user_A, user_B, duracao_horas=24, amostras_por_minuto=1):
+    """
+    Gera dataset para comunicação D2D via satélite (relay)
+    
+    Cenário: Terminal A → Satélite → Terminal B
+    
+    Features adicionais:
+    - Doppler uplink (A→Sat)
+    - Doppler downlink (Sat→B)
+    - Doppler total (soma dos dois)
+    - Distância A→Sat e Sat→B
+    - Elevações de A e B
+    """
+    
+    print(f"\nGerando dataset D2D com {len(satelites)} satélites...")
+    print(f"Terminal A: {user_A.latitude.degrees:.2f}°, {user_A.longitude.degrees:.2f}°")
+    print(f"Terminal B: {user_B.latitude.degrees:.2f}°, {user_B.longitude.degrees:.2f}°")
+    
+    ts = load.timescale()
+    c = 3e8
+    f_uplink = 14e9    # 14 GHz uplink (banda Ku)
+    f_downlink = 12e9  # 12 GHz downlink (banda Ku)
+    
+    # Tempo de simulação
+    t0 = ts.now()
+    num_amostras = int(duracao_horas * 60 * amostras_por_minuto)
+    t = ts.linspace(t0, t0 + duracao_horas/24, num_amostras)
+    dt = (duracao_horas * 3600) / num_amostras
+    
+    features_list = []
+    labels_list = []
+    metadata_list = []
+    
+    for idx, sat in enumerate(satelites):
+        print(f"Processando satélite {idx+1}/{len(satelites)}: {sat.name}", end='\r')
+        
+        try:
+            # Posições
+            geocentric = sat.at(t)
+            
+            # UPLINK: Terminal A → Satélite
+            diff_uplink = geocentric - user_A.at(t)
+            dist_uplink = diff_uplink.distance().km
+            topo_A = diff_uplink.altaz()
+            elev_A = topo_A[0].degrees
+            azim_A = topo_A[1].degrees
+            
+            # DOWNLINK: Satélite → Terminal B
+            diff_downlink = geocentric - user_B.at(t)
+            dist_downlink = diff_downlink.distance().km
+            topo_B = diff_downlink.altaz()
+            elev_B = topo_B[0].degrees
+            azim_B = topo_B[1].degrees
+            
+            # Posição geográfica do satélite
+            subpoint = wgs84.subpoint(geocentric)
+            lat_sat = subpoint.latitude.degrees
+            lon_sat = subpoint.longitude.degrees
+            alt_sat = subpoint.elevation.km
+            
+            # DOPPLER UPLINK (A→Sat)
+            vel_radial_up = np.gradient(dist_uplink * 1000, dt)  # m/s
+            doppler_uplink = f_uplink * vel_radial_up / c / 1e3  # kHz (sinal positivo!)
+            
+            # DOPPLER DOWNLINK (Sat→B)
+            vel_radial_down = np.gradient(dist_downlink * 1000, dt)  # m/s
+            doppler_downlink = -f_downlink * vel_radial_down / c / 1e3  # kHz
+            
+            # DOPPLER TOTAL D2D
+            doppler_total_d2d = doppler_uplink + doppler_downlink
+            
+            # Features derivadas
+            taxa_dist_up = np.gradient(dist_uplink, dt)
+            taxa_dist_down = np.gradient(dist_downlink, dt)
+            taxa_elev_A = np.gradient(elev_A, dt)
+            taxa_elev_B = np.gradient(elev_B, dt)
+            
+            # Velocidade do satélite
+            pos_xyz = geocentric.position.km
+            vel_xyz = np.gradient(pos_xyz, dt, axis=1)
+            velocidade_orbital = np.linalg.norm(vel_xyz, axis=0)
+            
+            # Construir features D2D
+            for i in range(len(t)):
+                # Apenas se satélite visível para AMBOS os terminais
+                if elev_A[i] > 0 and elev_B[i] > 0:
+                    features = [
+                        # Features uplink (A→Sat)
+                        dist_uplink[i],      # 0: Distância A→Sat
+                        elev_A[i],           # 1: Elevação vista de A
+                        azim_A[i],           # 2: Azimute vista de A
+                        taxa_dist_up[i],     # 3: Taxa variação dist A→Sat
+                        taxa_elev_A[i],      # 4: Taxa variação elevação A
+                        
+                        # Features downlink (Sat→B)
+                        dist_downlink[i],    # 5: Distância Sat→B
+                        elev_B[i],           # 6: Elevação vista de B
+                        azim_B[i],           # 7: Azimute vista de B
+                        taxa_dist_down[i],   # 8: Taxa variação dist Sat→B
+                        taxa_elev_B[i],      # 9: Taxa variação elevação B
+                        
+                        # Features do satélite
+                        lat_sat[i],          # 10: Latitude satélite
+                        lon_sat[i],          # 11: Longitude satélite
+                        alt_sat[i],          # 12: Altitude satélite
+                        velocidade_orbital[i], # 13: Velocidade orbital
+                        vel_xyz[0, i],       # 14: Vx
+                        vel_xyz[1, i],       # 15: Vy
+                        vel_xyz[2, i],       # 16: Vz
+                        
+                        # Features adicionais D2D
+                        doppler_uplink[i],   # 17: Doppler uplink isolado
+                        doppler_downlink[i], # 18: Doppler downlink isolado
+                    ]
+                    
+                    # LABEL: Doppler total D2D
+                    features_list.append(features)
+                    labels_list.append(doppler_total_d2d[i])
+                    metadata_list.append({
+                        'sat_name': sat.name,
+                        'timestamp': t[i].utc_iso(),
+                        'elev_A': elev_A[i],
+                        'elev_B': elev_B[i],
+                        'doppler_up': doppler_uplink[i],
+                        'doppler_down': doppler_downlink[i]
+                    })
+        
+        except Exception as e:
+            print(f"\nErro ao processar {sat.name}: {e}")
+            continue
+    
+    print(f"\n\nDataset D2D gerado: {len(features_list)} amostras")
+    
+    X = np.array(features_list)
+    y = np.array(labels_list)
+    
+    return X, y, metadata_list
+
 def gerar_dataset_doppler(satelites, user_location, duracao_horas=24, amostras_por_minuto=1):
     """
     Gera dataset de treinamento com features geométricas e Doppler como label
@@ -523,29 +661,32 @@ def compensacao_ml_tempo_real(satelite, user, modelo, scaler, duracao_min=10):
 
 if __name__ == "__main__":
     
-    # Configurações
-    user = wgs84.latlon(-23.55, -46.63)  # São Paulo
+    # Configurações D2D
+    user_A = wgs84.latlon(-23.55, -46.63)  # Terminal A: São Paulo
+    user_B = wgs84.latlon(-22.90, -43.17)  # Terminal B: Rio de Janeiro
     
     print("="*80)
-    print("SISTEMA DE COMPENSAÇÃO DOPPLER COM MACHINE LEARNING")
-    print("Constelação: Starlink | Localização: São Paulo, Brasil")
+    print("SISTEMA DE COMPENSAÇÃO DOPPLER D2D COM MACHINE LEARNING")
+    print("Comunicação: Terminal A → Satélite → Terminal B")
     print("="*80)
     
     # ETAPA 1: Baixar dados
-    satelites = baixar_satelites_starlink(num_satelites=20)  # Reduzido para teste rápido
+    satelites = baixar_satelites_starlink(num_satelites=20)
     
-    # ETAPA 2: Gerar dataset
-    X, y, metadata = gerar_dataset_doppler(
+    # ETAPA 2: Gerar dataset D2D
+    X, y, metadata = gerar_dataset_doppler_d2d(
         satelites, 
-        user, 
-        duracao_horas=6,  # 6 horas de dados
-        amostras_por_minuto=2  # 2 amostras/minuto
+        user_A, 
+        user_B,
+        duracao_horas=6,
+        amostras_por_minuto=2
     )
     
-    print(f"\nShape do dataset: X={X.shape}, y={y.shape}")
-    print(f"Range Doppler: [{y.min():.2f}, {y.max():.2f}] kHz")
+    print(f"\nShape do dataset D2D: X={X.shape}, y={y.shape}")
+    print(f"Range Doppler D2D: [{y.min():.2f}, {y.max():.2f}] kHz")
+    print(f"  (Uplink + Downlink combinados)")
     
-    # ETAPA 3: Treinar modelos
+    # ETAPA 3:
     resultados, scaler, X_test, y_test = treinar_modelos(X, y)
     
     # ETAPA 4: Visualizar resultados
